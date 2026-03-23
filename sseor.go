@@ -5,10 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,7 +18,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// Context keys for user data
+// ContextKey Context keys for user data
 type ContextKey string
 
 const (
@@ -42,6 +40,7 @@ type Event struct {
 type Connection struct {
 	ID       string
 	UserID   string
+	GroupID  string // <-- new: campaignInstanceId or other logical group
 	Writer   http.ResponseWriter
 	Request  *http.Request
 	Done     chan bool
@@ -105,131 +104,26 @@ type Metrics struct {
 	Uptime                int64          `json:"uptime_seconds"`
 }
 
-// Claims represents OIDC token claims
-type Claims struct {
-	Exp            int64    `json:"exp"`
-	Iat            int64    `json:"iat"`
-	Jti            string   `json:"jti"`
-	Iss            string   `json:"iss"`
-	Aud            []string `json:"aud"`
-	Id             string   `json:"sub"`
-	Typ            string   `json:"typ"`
-	Azp            string   `json:"azp"`
-	Acr            string   `json:"acr"`
-	AllowedOrigins []string `json:"allowed-origins"`
-
-	RealmAccess struct {
-		Roles []string `json:"roles"`
-	} `json:"realm_access"`
-
-	ResourceAccess map[string]struct {
-		Roles []string `json:"roles"`
-	} `json:"resource_access"`
-
-	Scope             string `json:"scope"`
-	Sid               string `json:"sid,omitempty"`
-	SessionState      string `json:"session_state,omitempty"`
-	Country           string `json:"country,omitempty"`
-	State             string `json:"state,omitempty"`
-	EmailVerified     bool   `json:"email_verified"`
-	Name              string `json:"name,omitempty"`
-	PreferredUsername string `json:"preferred_username"`
-	GivenName         string `json:"given_name,omitempty"`
-	FamilyName        string `json:"family_name,omitempty"`
-	Email             string `json:"email,omitempty"`
-	ClientHost        string `json:"clientHost,omitempty"`
-	ClientAddress     string `json:"clientAddress,omitempty"`
-	ClientID          string `json:"client_id,omitempty"`
-}
-
-// ExpiresAt returns the expiration time as time.Time
-func (c *Claims) ExpiresAt() time.Time {
-	return time.Unix(c.Exp, 0)
-}
-
-// IssuedAt returns the issue time as time.Time
-func (c *Claims) IssuedAt() time.Time {
-	return time.Unix(c.Iat, 0)
-}
-
-// IsExpired checks if the token has expired
-func (c *Claims) IsExpired() bool {
-	return time.Now().After(c.ExpiresAt())
-}
-
-func (c *Claims) HasRole(role string) bool {
-	return slices.Contains(c.RealmAccess.Roles, role)
-}
-
-func (c *Claims) IsClientToken() bool {
-	// If preferred_username starts with "service-account-" it's a client credentials token
-	if len(c.PreferredUsername) >= 16 && c.PreferredUsername[:15] == "service-account" {
-		return true
-	}
-
-	// If there is no email or name, and client_id is present, it's probably a client token
-	if c.ClientID != "" && c.Name == "" && c.Email == "" {
-		return true
-	}
-
-	return false
-}
-
-func (c *Claims) GetRole() string {
-	defaultRoles := []string{
-		"default-roles-shooters",
-		"default-roles-gh-realm",
-		"offline_access",
-		"uma_authorization",
-	}
-
-	for _, role := range c.RealmAccess.Roles {
-		if !slices.Contains(defaultRoles, role) {
-			return role
-		}
-	}
-
-	return ""
-}
-
-func (c *Claims) String() string {
-	jb, _ := json.MarshalIndent(c, "", " \t")
-	return string(jb)
-}
-
-// GetUserID returns the user ID from claims, preferring the sub claim
-func (c *Claims) GetUserID() string {
-	if c.Id != "" {
-		return c.Id
-	}
-	if c.PreferredUsername != "" {
-		return c.PreferredUsername
-	}
-	if c.Email != "" {
-		return c.Email
-	}
-	return ""
-}
-
 // Manager manages SSE connections with Redis backend and production features
 type Manager struct {
 	config        *Config
 	redisClient   *redis.Client
 	connections   map[string]*Connection // connectionID -> Connection
 	userConns     map[string][]string    // userID -> []connectionID
+	groupConns    map[string][]string    // groupID -> []connectionID  <-- NEW
 	mutex         sync.RWMutex
 	router        *mux.Router
 	server        *http.Server
 	cleanupTicker *time.Ticker
 	ctx           context.Context
 	cancel        context.CancelFunc
-	logger        *slog.Logger
-	authFunc      AuthFunc
-	metrics       *Metrics
-	metricsLock   sync.RWMutex
-	startTime     time.Time
-	rateLimiter   *rate.Limiter // Global rate limiter
-	oidcVerifier  *oidc.IDTokenVerifier
+	//logger        nextools.LoggerClient
+	authFunc     AuthFunc
+	metrics      *Metrics
+	metricsLock  sync.RWMutex
+	startTime    time.Time
+	rateLimiter  *rate.Limiter // Global rate limiter
+	oidcVerifier *oidc.IDTokenVerifier
 }
 
 // NewManager creates a new SSE Manager with enhanced features
@@ -241,19 +135,6 @@ func NewManager(config *Config) (*Manager, error) {
 	// Validate configuration
 	if err := ValidateConfig(config); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
-	}
-
-	// Initialize structured logger
-	var logger *slog.Logger
-	switch config.LogLevel {
-	case "debug":
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	case "warn":
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	case "error":
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	default:
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
 
 	// Parse Redis URL
@@ -270,7 +151,7 @@ func NewManager(config *Config) (*Manager, error) {
 	opt.ConnMaxIdleTime = 5 * time.Minute
 	opt.ConnMaxLifetime = 30 * time.Minute
 
-	// Create Redis client with connection pooling
+	// Create a Redis client with connection pooling
 	client := redis.NewClient(opt)
 
 	// Test Redis connection
@@ -286,10 +167,11 @@ func NewManager(config *Config) (*Manager, error) {
 		redisClient: client,
 		connections: make(map[string]*Connection),
 		userConns:   make(map[string][]string),
+		groupConns:  make(map[string][]string), // NEW
 		router:      mux.NewRouter(),
 		ctx:         ctx,
 		cancel:      cancel,
-		logger:      logger,
+		//logger:      logger,
 		metrics: &Metrics{
 			ConnectionsPerUser: make(map[string]int),
 		},
@@ -321,12 +203,12 @@ func NewManager(config *Config) (*Manager, error) {
 	// Subscribe to Redis for cross-service messaging
 	go manager.subscribeToRedis()
 
-	logger.Info("🚀 [SSEOR] SSE Manager initialized",
-		"redis_url", config.RedisURL,
-		"pool_size", config.RedisPoolSize,
-		"rate_limit_rps", config.RateLimitRPS,
-		"oidc_enabled", manager.oidcVerifier != nil,
-	)
+	//logger.Info("🚀 [SSEOR] SSE Manager initialized",
+	//	nextools.F("redis_url", config.RedisURL),
+	//	nextools.F("pool_size", config.RedisPoolSize),
+	//	nextools.F("rate_limit_rps", config.RateLimitRPS),
+	//	nextools.F("oidc_enabled", manager.oidcVerifier != nil),
+	//)
 
 	return manager, nil
 }
@@ -346,10 +228,10 @@ func (m *Manager) initOIDCVerifier() error {
 
 	m.oidcVerifier = provider.Verifier(oidcConfig)
 
-	m.logger.Info("OIDC verifier initialized",
-		"issuer", m.config.OIDCIssuerURL,
-		"client_id", m.config.OIDCClientID,
-	)
+	//m.logger.Info("OIDC verifier initialized",
+	//	nextools.F("issuer", m.config.OIDCIssuerURL),
+	//	nextools.F("client_id", m.config.OIDCClientID),
+	//)
 
 	return nil
 }
@@ -429,15 +311,15 @@ func (m *Manager) Route(path string, handler HandlerFunc) {
 // AuthMiddleware provides authentication middleware
 func (m *Manager) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		m.logger.Debug("👮 [AuthMiddleware]: Authenticating request")
+		//m.logger.Debug("👮 [AuthMiddleware]: Authenticating request")
 
 		userID, err := m.authFunc(r)
 		if err != nil {
 			m.updateMetric(func(m *Metrics) { m.AuthFailures++ })
-			m.logger.Warn("Authentication failed",
-				"error", err,
-				"client_ip", m.getClientIP(r),
-			)
+			//m.logger.Warn("Authentication failed",
+			//	nextools.F("error", err),
+			//	nextools.F("client_ip", m.getClientIP(r)),
+			//)
 			http.Error(w, fmt.Sprintf("Authentication failed: %s", err), http.StatusUnauthorized)
 			return
 		}
@@ -455,13 +337,13 @@ func (m *Manager) NamespaceMiddleware(next http.Handler) http.Handler {
 		state := r.Header.Get("X-State-Iso2")
 
 		if country == "" {
-			m.logger.Warn("Missing X-Country-Iso2 header", "client_ip", m.getClientIP(r))
+			//m.logger.Warn("Missing X-Country-Iso2 header", nextools.F("client_ip", m.getClientIP(r)))
 			http.Error(w, "X-Country-Iso2 header required", http.StatusBadRequest)
 			return
 		}
 
 		if state == "" {
-			m.logger.Warn("Missing X-State-Iso2 header", "client_ip", m.getClientIP(r))
+			//m.logger.Warn("Missing X-State-Iso2 header", nextools.F("client_ip", m.getClientIP(r)))
 			http.Error(w, "X-State-Iso2 header required", http.StatusBadRequest)
 			return
 		}
@@ -505,16 +387,16 @@ func (m *Manager) ListenAndServe(addr string) error {
 		ReadHeaderTimeout: 10 * time.Second, // Only timeout for reading headers
 	}
 
-	m.logger.Info("Starting SSE server", "addr", addr)
+	//m.logger.Info("Starting SSE server", nextools.F("addr", addr))
 	return m.server.ListenAndServe()
 }
 
 // HandleSSE handles incoming SSE connections with authentication and rate limiting
-func (m *Manager) HandleSSE(w http.ResponseWriter, r *http.Request, userID string) error {
+func (m *Manager) HandleSSE(w http.ResponseWriter, r *http.Request, userID, groupID string) error {
 	// Global rate limiting
 	if !m.rateLimiter.Allow() {
 		m.updateMetric(func(m *Metrics) { m.RateLimitedRequests++ })
-		m.logger.Warn("Rate limit exceeded", "client_ip", m.getClientIP(r))
+		//m.logger.Warn("Rate limit exceeded", nextools.F("client_ip", m.getClientIP(r)))
 		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 		return fmt.Errorf("rate limit exceeded")
 	}
@@ -524,7 +406,7 @@ func (m *Manager) HandleSSE(w http.ResponseWriter, r *http.Request, userID strin
 		if contextUserID, ok := m.GetUserIDFromContext(r.Context()); ok {
 			userID = contextUserID
 		} else if m.config.AuthRequired {
-			m.logger.Warn("No user ID provided and none found in context")
+			//m.logger.Warn("No user ID provided and none found in context")
 			http.Error(w, "Authentication required", http.StatusUnauthorized)
 			return fmt.Errorf("no user ID available")
 		} else {
@@ -561,6 +443,7 @@ func (m *Manager) HandleSSE(w http.ResponseWriter, r *http.Request, userID strin
 	conn := &Connection{
 		ID:       connID,
 		UserID:   userID,
+		GroupID:  groupID,
 		Writer:   w,
 		Request:  r,
 		Done:     make(chan bool),
@@ -580,29 +463,29 @@ func (m *Manager) HandleSSE(w http.ResponseWriter, r *http.Request, userID strin
 	})
 
 	// Get additional context data for logging
-	var logData []interface{}
-	logData = append(logData,
-		"connection_id", connID,
-		"user_id", userID,
-		"client_ip", m.getClientIP(r),
-		"user_agent", r.UserAgent(),
-	)
+	//var logData []nextools.Field
+	//logData = append(logData,
+	//	nextools.F("connection_id", connID),
+	//	nextools.F("user_id", userID),
+	//	nextools.F("client_ip", m.getClientIP(r)),
+	//	nextools.F("user_agent", r.UserAgent()),
+	//)
 
 	// Add namespace info if available
-	if country, state, ok := m.GetNamespaceFromContext(r.Context()); ok {
-		logData = append(logData, "country", country, "state", state)
-	}
+	//if country, state, ok := m.GetNamespaceFromContext(r.Context()); ok {
+	//logData = append(logData, nextools.F("country", country), nextools.F("state", state))
+	//}
 
 	// Add claims info if available
-	if claims, ok := m.GetClaimsFromContext(r.Context()); ok {
-		logData = append(logData,
-			"preferred_username", claims.PreferredUsername,
-			"email", claims.Email,
-			"roles", claims.RealmAccess.Roles,
-		)
-	}
+	//if claims, ok := m.GetClaimsFromContext(r.Context()); ok {
+	//logData = append(logData,
+	//	nextools.F("preferred_username", claims.PreferredUsername),
+	//	nextools.F("email", claims.Email),
+	//	nextools.F("roles", claims.RealmAccess.Roles),
+	//)
+	//}
 
-	m.logger.Info("New SSE connection", logData...)
+	//m.logger.OK("New SSE connection", logData...)
 
 	// Prepare initial event data
 	initialEventData := map[string]interface{}{
@@ -651,13 +534,13 @@ func (m *Manager) HandleSSE(w http.ResponseWriter, r *http.Request, userID strin
 	for {
 		select {
 		case <-conn.Done:
-			m.logger.Debug("Connection done", "connection_id", connID)
+			//m.logger.Debug("Connection done", nextools.F("connection_id", connID))
 			return nil
 		case <-r.Context().Done():
-			m.logger.Debug("Request context done", "connection_id", connID)
+			//m.logger.Debug("Request context done", nextools.F("connection_id", connID))
 			return nil
 		case <-m.ctx.Done():
-			m.logger.Debug("Manager context done", "connection_id", connID)
+			//m.logger.Debug("Manager context done", nextools.F("connection_id", connID))
 			return nil
 		case <-heartbeatTicker.C:
 			// Update last seen time
@@ -671,10 +554,10 @@ func (m *Manager) HandleSSE(w http.ResponseWriter, r *http.Request, userID strin
 				},
 			}
 			if err := m.sendEventToConnection(conn, heartbeat); err != nil {
-				m.logger.Error("Failed to send heartbeat",
-					"connection_id", connID,
-					"error", err,
-				)
+				//m.logger.Error("Failed to send heartbeat",
+				//	nextools.F("connection_id", connID),
+				//	nextools.Err(err),
+				//)
 				return err
 			}
 			flusher.Flush()
@@ -726,6 +609,36 @@ func (m *Manager) PublishToAll(ctx context.Context, event Event) error {
 	return m.publishToRedis("*", event)
 }
 
+// PublishToGroup sends event to all connections in a group
+func (m *Manager) PublishToGroup(ctx context.Context, groupID string, event Event) error {
+	if event.Data == nil {
+		event.Data = make(map[string]interface{})
+	}
+	if _, exists := event.Data["timestamp"]; !exists {
+		event.Data["timestamp"] = time.Now().Unix()
+	}
+
+	// Update metrics
+	m.updateMetric(func(m *Metrics) { m.MessagesSent++ })
+
+	// Send to local connections
+	m.mutex.RLock()
+	connIDs := append([]string{}, m.groupConns[groupID]...)
+	m.mutex.RUnlock()
+
+	for _, connID := range connIDs {
+		m.mutex.RLock()
+		conn, exists := m.connections[connID]
+		m.mutex.RUnlock()
+		if exists {
+			_ = m.sendEventToConnection(conn, event)
+		}
+	}
+
+	// Also publish to Redis so other service instances can deliver
+	return m.publishToRedis(fmt.Sprintf("group:%s", groupID), event)
+}
+
 // GetConnectionCount returns the number of active connections for a user
 func (m *Manager) GetConnectionCount(userID string) int {
 	m.mutex.RLock()
@@ -760,7 +673,7 @@ func (m *Manager) GetMetrics() Metrics {
 
 // Close gracefully shuts down the manager
 func (m *Manager) Close() error {
-	m.logger.Info("Shutting down SSE Manager")
+	//m.logger.Info("Shutting down SSE Manager")
 	m.cancel()
 
 	if m.cleanupTicker != nil {
@@ -776,7 +689,7 @@ func (m *Manager) Close() error {
 
 	// Close Redis client
 	if err := m.redisClient.Close(); err != nil {
-		m.logger.Error("Failed to close redis client", "error", err)
+		//m.logger.Error("Failed to close redis client", nextools.Err(err))
 		return fmt.Errorf("failed to close redis client: %w", err)
 	}
 
@@ -835,6 +748,10 @@ func (m *Manager) addConnection(conn *Connection) {
 
 	m.connections[conn.ID] = conn
 	m.userConns[conn.UserID] = append(m.userConns[conn.UserID], conn.ID)
+
+	if conn.GroupID != "" {
+		m.groupConns[conn.GroupID] = append(m.groupConns[conn.GroupID], conn.ID)
+	}
 }
 
 func (m *Manager) removeConnection(connID string) {
@@ -874,6 +791,19 @@ func (m *Manager) removeConnection(connID string) {
 		delete(m.userConns, conn.UserID)
 	}
 
+	if conn.GroupID != "" {
+		groupConns := m.groupConns[conn.GroupID]
+		for i, id := range groupConns {
+			if id == connID {
+				m.groupConns[conn.GroupID] = append(groupConns[:i], groupConns[i+1:]...)
+				break
+			}
+		}
+		if len(m.groupConns[conn.GroupID]) == 0 {
+			delete(m.groupConns, conn.GroupID)
+		}
+	}
+
 	// Close the done channel
 	select {
 	case <-conn.Done:
@@ -882,7 +812,7 @@ func (m *Manager) removeConnection(connID string) {
 		close(conn.Done)
 	}
 
-	m.logger.Debug("Connection removed", "connection_id", connID, "user_id", conn.UserID)
+	//m.logger.Debug("Connection removed", nextools.F("connection_id", connID), nextools.F("user_id", conn.UserID))
 }
 
 func (m *Manager) sendEventToConnection(conn *Connection, event Event) error {
@@ -943,11 +873,11 @@ func (m *Manager) sendToLocalConnections(userID string, event Event) {
 		}
 
 		if err := m.sendEventToConnection(conn, event); err != nil {
-			m.logger.Error("Failed to send event to connection",
-				"connection_id", connID,
-				"user_id", userID,
-				"error", err,
-			)
+			//m.logger.Error("Failed to send event to connection",
+			//	nextools.F("connection_id", connID),
+			//	nextools.F("user_id", userID),
+			//	nextools.F("error", err),
+			//)
 			m.removeConnection(connID)
 		}
 	}
@@ -967,7 +897,7 @@ func (m *Manager) publishToRedis(userID string, event Event) error {
 	err = m.redisClient.Publish(m.ctx, "sse_events", string(data)).Err()
 	if err != nil {
 		m.updateMetric(func(m *Metrics) { m.RedisConnectionErrors++ })
-		m.logger.Error("Failed to publish to Redis", "error", err)
+		//m.logger.Error("Failed to publish to Redis", nextools.Err(err))
 	}
 	return err
 }
@@ -981,7 +911,7 @@ func (m *Manager) subscribeToRedis() {
 			pubsub := m.redisClient.Subscribe(m.ctx, "sse_events")
 			ch := pubsub.Channel()
 
-			m.logger.Info("Subscribed to Redis SSE events")
+			//m.logger.Info("Subscribed to Redis SSE events")
 
 			func() {
 				defer pubsub.Close()
@@ -992,7 +922,7 @@ func (m *Manager) subscribeToRedis() {
 						return
 					case msg, ok := <-ch:
 						if !ok {
-							m.logger.Warn("Redis subscription channel closed")
+							//m.logger.Warn("Redis subscription channel closed")
 							return
 						}
 
@@ -1004,7 +934,7 @@ func (m *Manager) subscribeToRedis() {
 						}
 
 						if err := json.Unmarshal([]byte(msg.Payload), &message); err != nil {
-							m.logger.Error("Failed to unmarshal redis message", "error", err)
+							//m.logger.Error("Failed to unmarshal redis message", nextools.Err(err))
 							continue
 						}
 
@@ -1030,7 +960,7 @@ func (m *Manager) subscribeToRedis() {
 
 			// If we get here, the subscription was closed. Wait and retry.
 			m.updateMetric(func(m *Metrics) { m.RedisConnectionErrors++ })
-			m.logger.Warn("Redis subscription lost, retrying in 5 seconds")
+			//m.logger.Warn("Redis subscription lost, retrying in 5 seconds")
 			time.Sleep(5 * time.Second)
 		}
 	}
@@ -1063,14 +993,14 @@ func (m *Manager) storeConnectionInRedis(conn *Connection) {
 	// Store for 30 minutes
 	if err := m.redisClient.SetEx(m.ctx, key, string(jsonData), 30*time.Minute).Err(); err != nil {
 		m.updateMetric(func(m *Metrics) { m.RedisConnectionErrors++ })
-		m.logger.Error("Failed to store connection in Redis", "error", err)
+		//m.logger.Error("Failed to store connection in Redis", nextools.Err(err))
 	}
 }
 
 func (m *Manager) removeConnectionFromRedis(connID string) {
 	key := fmt.Sprintf("sse_conn:%s", connID)
 	if err := m.redisClient.Del(m.ctx, key).Err(); err != nil {
-		m.logger.Error("Failed to remove connection from Redis", "error", err)
+		//m.logger.Error("Failed to remove connection from Redis", nextools.Err(err))
 	}
 }
 
@@ -1104,7 +1034,7 @@ func (m *Manager) cleanupStaleConnections() {
 	}
 
 	for _, connID := range staleConnIDs {
-		m.logger.Info("Cleaning up stale connection", "connection_id", connID)
+		//m.logger.Info("Cleaning up stale connection", nextools.F("connection_id", connID))
 		m.removeConnection(connID)
 		m.removeConnectionFromRedis(connID)
 	}
@@ -1188,10 +1118,10 @@ func (m *Manager) RateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !m.rateLimiter.Allow() {
 			m.updateMetric(func(m *Metrics) { m.RateLimitedRequests++ })
-			m.logger.Warn("Global rate limit exceeded",
-				"client_ip", m.getClientIP(r),
-				"path", r.URL.Path,
-			)
+			//m.logger.Warn("Global rate limit exceeded",
+			//	nextools.F("client_ip", m.getClientIP(r)),
+			//	nextools.F("path", r.URL.Path),
+			//)
 			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
@@ -1202,23 +1132,23 @@ func (m *Manager) RateLimitMiddleware(next http.Handler) http.Handler {
 // LoggingMiddleware creates a structured logging middleware
 func (m *Manager) LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
+		//start := time.Now()
 
 		// Wrap the ResponseWriter to capture status code
 		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 
 		next.ServeHTTP(wrapped, r)
 
-		duration := time.Since(start)
+		//duration := time.Since(start)
 
-		m.logger.Info("HTTP request",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", wrapped.statusCode,
-			"duration_ms", duration.Milliseconds(),
-			"client_ip", m.getClientIP(r),
-			"user_agent", r.UserAgent(),
-		)
+		//m.logger.Info("HTTP request",
+		//	nextools.F("method", r.Method),
+		//	nextools.F("path", r.URL.Path),
+		//	nextools.F("status", wrapped.statusCode),
+		//	nextools.F("duration_ms", duration.Milliseconds()),
+		//	nextools.F("client_ip", m.getClientIP(r)),
+		//	nextools.F("user_agent", r.UserAgent()),
+		//)
 	})
 }
 

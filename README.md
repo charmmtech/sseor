@@ -30,7 +30,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/shoot3rs/sseor"
+	"github.com/charmmtech/sseor"
 )
 
 func main() {

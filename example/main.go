@@ -10,9 +10,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/charmmtech/sseor"
 	"github.com/gorilla/mux"
 	"github.com/redis/go-redis/v9"
-	"github.com/shoot3rs/sseor"
 )
 
 // Transaction represents a wallet deposit transaction
@@ -320,7 +320,7 @@ func (ts *TransactionServer) HandleTransactionSSE(w http.ResponseWriter, r *http
 	}()
 
 	// Handle the SSE connection
-	if err := manager.HandleSSE(w, r, transactionUserKey); err != nil {
+	if err := manager.HandleSSE(w, r, transactionUserKey, ""); err != nil {
 		log.Printf("SSE connection error for transaction %s: %v", transactionID, err)
 	}
 }
@@ -400,7 +400,7 @@ func main() {
 	config := sseor.ConfigFromEnv()
 	config.AuthRequired = true
 	config.RequireNamespace = false
-	config.OIDCIssuerURL = "https://accounts.piveredu.com/realms/gh-realm"
+	config.OIDCIssuerURL = "https://accounts.charmm.net/realms/gh-realm"
 	config.OIDCClientID = "api"
 
 	// Initialize SSE Manager
